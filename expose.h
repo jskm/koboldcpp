@@ -4,6 +4,7 @@ const int stop_token_max = 16;
 const int ban_token_max = 16;
 const int tensor_split_max = 16;
 const int logit_bias_max = 16;
+const size_t n_probs_max = 16;
 // match kobold's sampler list and order
 enum samplers
 {
@@ -86,6 +87,7 @@ struct generation_inputs
     const float dynatemp_range = 0.0f;
     const float dynatemp_exponent = 1.0f;
     const float smoothing_factor = 0.0f;
+    const int n_probs = 0;
     const logit_bias logit_biases[logit_bias_max];
 
 };
@@ -111,3 +113,15 @@ extern int last_token_count;
 extern int last_seed;
 extern int total_gens;
 extern stop_reason last_stop_reason;
+
+struct token_prob_data
+{
+    char token[64]; // token
+    float prob;     // probability of the token
+};
+struct token_probs_outputs
+{
+    int count = 0;
+    token_prob_data candidates[n_probs_max];
+};
+extern std::vector<token_probs_outputs> generated_tokens_probs;

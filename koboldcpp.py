@@ -12,6 +12,7 @@ import ctypes
 import os
 import argparse
 import json, sys, http.server, time, asyncio, socket, threading
+import math
 from concurrent.futures import ThreadPoolExecutor
 
 sampler_order_max = 7
@@ -21,6 +22,7 @@ tensor_split_max = 16
 logit_bias_max = 16
 bias_min_value = -100.0
 bias_max_value = 100.0
+n_probs_max = 16
 
 class load_model_inputs(ctypes.Structure):
     _fields_ = [("threads", ctypes.c_int),
@@ -83,6 +85,7 @@ class generation_inputs(ctypes.Structure):
                 ("dynatemp_range", ctypes.c_float),
                 ("dynatemp_exponent", ctypes.c_float),
                 ("smoothing_factor", ctypes.c_float),
+                ("n_probs", ctypes.c_int),
                 ("logit_biases", logit_bias * logit_bias_max)]
 
 class generation_outputs(ctypes.Structure):
@@ -92,6 +95,14 @@ class generation_outputs(ctypes.Structure):
 class token_count_outputs(ctypes.Structure):
     _fields_ = [("count", ctypes.c_int),
                 ("ids", ctypes.POINTER(ctypes.c_int))]
+
+class token_prob_data(ctypes.Structure):
+    _fields_ = [("token", ctypes.c_char * 64),
+                ("prob", ctypes.c_float)]
+
+class token_probs_outputs(ctypes.Structure):
+    _fields_ = [("count", ctypes.c_int),
+                ("candidates", token_prob_data * n_probs_max)]
 
 handle = None
 
@@ -248,6 +259,8 @@ def init_library():
     handle.abort_generate.restype = ctypes.c_bool
     handle.token_count.restype = token_count_outputs
     handle.get_pending_output.restype = ctypes.c_char_p
+    handle.token_probs.argtypes = [ctypes.c_int]
+    handle.token_probs.restype = token_probs_outputs
 
 def load_model(model_filename):
     global args
@@ -338,7 +351,7 @@ def load_model(model_filename):
     ret = handle.load_model(inputs)
     return ret
 
-def generate(prompt, memory="", max_length=32, max_context_length=512, temperature=0.7, top_k=100, top_a=0.0, top_p=0.92, min_p=0.0, typical_p=1.0, tfs=1.0, rep_pen=1.0, rep_pen_range=128, presence_penalty=0.0, mirostat=0, mirostat_tau=5.0, mirostat_eta=0.1, sampler_order=[6,0,1,3,4,2,5], seed=-1, stop_sequence=[], use_default_badwordsids=False, stream_sse=False, grammar='', grammar_retain_state=False, genkey='', trimstop=False, quiet=False, dynatemp_range=0.0, dynatemp_exponent=1.0, smoothing_factor=0.0, logit_biases={}):
+def generate(prompt, memory="", max_length=32, max_context_length=512, temperature=0.7, top_k=100, top_a=0.0, top_p=0.92, min_p=0.0, typical_p=1.0, tfs=1.0, rep_pen=1.0, rep_pen_range=128, presence_penalty=0.0, mirostat=0, mirostat_tau=5.0, mirostat_eta=0.1, sampler_order=[6,0,1,3,4,2,5], seed=-1, stop_sequence=[], use_default_badwordsids=False, stream_sse=False, grammar='', grammar_retain_state=False, genkey='', trimstop=False, quiet=False, dynatemp_range=0.0, dynatemp_exponent=1.0, smoothing_factor=0.0, n_probs=0, logit_biases={}):
     global maxctx, args, currentusergenkey, totalgens, pendingabortkey
     inputs = generation_inputs()
     outputs = ctypes.create_unicode_buffer(ctypes.sizeof(generation_outputs))
@@ -370,6 +383,7 @@ def generate(prompt, memory="", max_length=32, max_context_length=512, temperatu
     inputs.dynatemp_range = dynatemp_range
     inputs.dynatemp_exponent = dynatemp_exponent
     inputs.smoothing_factor = smoothing_factor
+    inputs.n_probs = n_probs
     inputs.grammar = grammar.encode("UTF-8")
     inputs.grammar_retain_state = grammar_retain_state
     inputs.unban_tokens_rt = not use_default_badwordsids
@@ -538,6 +552,13 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 genparams["use_default_badwordsids"] = genparams.get('ignore_eos', False)
                 genparams["mirostat"] = genparams.get('mirostat_mode', 0)
 
+                logprobs = genparams.get('logprobs') # int (format 3), bool (format 4), or None
+                if logprobs == True:
+                    logprobs = genparams.get('top_logprobs', 0)
+                elif not logprobs:
+                    logprobs = 0
+                genparams["n_probs"] = logprobs
+
                 if api_format==4:
                     # translate openai chat completion messages format into one big string.
                     messages_array = genparams.get('messages', [])
@@ -601,6 +622,7 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 dynatemp_range=genparams.get('dynatemp_range', 0.0),
                 dynatemp_exponent=genparams.get('dynatemp_exponent', 1.0),
                 smoothing_factor=genparams.get('smoothing_factor', 0.0),
+                n_probs=genparams.get('n_probs', 0),
                 logit_biases=genparams.get('logit_bias', {})
                 )
 
@@ -646,7 +668,7 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(f'data: {data}\n\n'.encode())
         self.wfile.flush()
 
-    async def handle_sse_stream(self, api_format):
+    async def handle_sse_stream(self, api_format, include_probs=False):
         global friendlymodelname
         self.send_response(200)
         self.send_header("cache-control", "no-cache")
@@ -667,7 +689,6 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     if token is None: # Token isnt ready yet, received nullpointer
                         break
 
-                    current_token += 1
                     newbyte = ctypes.string_at(token)
                     incomplete_token_buffer += bytearray(newbyte)
                     tokenSeg = incomplete_token_buffer.decode("UTF-8","ignore")
@@ -675,20 +696,57 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                         incomplete_token_buffer.clear()
                         tokenStr += tokenSeg
 
-                if tokenStr!="":
-                    if api_format == 4:  # if oai chat, set format to expected openai streaming response
-                        event_str = json.dumps({"id":"koboldcpp","object":"chat.completion.chunk","created":1,"model":friendlymodelname,"choices":[{"index":0,"finish_reason":"length","delta":{'role':'assistant','content':tokenStr}}]})
-                        await self.send_oai_sse_event(event_str)
-                    elif api_format == 3:  # non chat completions
-                        event_str = json.dumps({"id":"koboldcpp","object":"text_completion","created":1,"model":friendlymodelname,"choices":[{"index":0,"finish_reason":"length","text":tokenStr}]})
-                        await self.send_oai_sse_event(event_str)
-                    else:
-                        event_str = json.dumps({"token": tokenStr})
-                        await self.send_kai_sse_event(event_str)
-                    tokenStr = ""
+                    if include_probs:
+                        token_probs = handle.token_probs(current_token)
+                        candidates = token_probs.candidates[:token_probs.count]
+                        candidate_probs = {
+                            ctypes.string_at(c.token).decode("utf-8", "backslashreplace"): c.prob
+                            for c in candidates
+                        }
 
-                else:
-                    await asyncio.sleep(0.02) #this should keep things responsive
+                    current_token += 1
+
+                    if tokenStr!="":
+                        if api_format == 4:  # if oai chat, set format to expected openai streaming response
+                            choice = {"index":0,"finish_reason":"length","delta":{'role':'assistant','content':tokenStr}}
+                            if include_probs:
+                                top_logprobs = [
+                                    {"token": token, "logprob": math.log(prob) if prob else -sys.float_info.max}
+                                    for token, prob in candidate_probs.items()
+                                ]
+                                choice["logprobs"] = {
+                                    "content": [{
+                                        "token": tokenStr,
+                                        "top_logprobs": top_logprobs
+                                    }]
+                                }
+                            data = {"id":"koboldcpp","object":"chat.completion.chunk","created":1,"model":friendlymodelname,"choices":[choice]}
+                            event_str = json.dumps(data)
+                            await self.send_oai_sse_event(event_str)
+                        elif api_format == 3:  # non chat completions
+                            choice = {"index":0,"finish_reason":"length","text":tokenStr}
+                            if include_probs:
+                                top_logprobs = {token: math.log(prob) if prob else -sys.float_info.max for token, prob in candidate_probs.items()}
+                                choice["logprobs"] = {"top_logprobs": [top_logprobs]}
+                            data = {"id":"koboldcpp","object":"text_completion","created":1,"model":friendlymodelname,"choices":[choice]}
+                            event_str = json.dumps(data)
+                            await self.send_oai_sse_event(event_str)
+                        else:
+                            data = {"token": tokenStr}
+                            if include_probs:
+                                data["completion_probabilities"] = [{
+                                    "content": newbyte.decode("utf-8", "backslashreplace"),
+                                    "probs": [{
+                                        "prob": prob,
+                                        "tok_str": token,
+                                    } for token, prob in candidate_probs.items()],
+                                }]
+                            event_str = json.dumps(data)
+                            await self.send_kai_sse_event(event_str)
+                        tokenStr = ""
+
+                    else:
+                        await asyncio.sleep(0.02) #this should keep things responsive
 
                 if streamDone:
                     if api_format == 4 or api_format == 3:  # if oai chat, send last [DONE] message consistent with openai format
@@ -712,7 +770,8 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         try:
             if stream_flag:
-                tasks.append(self.handle_sse_stream(api_format))
+                include_probs = bool(genparams.get("n_probs", 0) or genparams.get("logprobs", 0))
+                tasks.append(self.handle_sse_stream(api_format, include_probs))
 
             generate_task = asyncio.create_task(self.generate_text(genparams, api_format, stream_flag))
             tasks.append(generate_task)

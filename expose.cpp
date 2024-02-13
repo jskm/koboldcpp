@@ -221,6 +221,13 @@ extern "C"
         return generated_tokens.size();
     }
 
+    const token_probs_outputs token_probs(int idx) {
+        token_probs_outputs out;
+        if (generated_tokens_probs.size() <= idx || idx < 0) return out;
+        out = generated_tokens_probs[idx];
+        return out;
+    }
+
     bool has_finished() {
         return generation_finished;
     }

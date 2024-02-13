@@ -43,6 +43,7 @@ int last_seed = -1;
 int total_gens = 0;
 stop_reason last_stop_reason = stop_reason::INVALID;
 std::vector<std::string> generated_tokens;
+std::vector<token_probs_outputs> generated_tokens_probs;
 
 llama_grammar *  grammar = nullptr; //currently used grammar
 grammar_parser::parse_state parsed_grammar;
@@ -279,15 +280,9 @@ llama_token sample_token(llama_token_data_array * candidates, std::mt19937 & rng
     std::discrete_distribution<> dist(probs.begin(), probs.end());
     int idx = dist(rng);
 
-    if(debugmode==1)
-    {
-        top_picks.push_back(candidates->data[idx]);
-        for (size_t i = 0; (i < candidates->size && i<4); ++i)
-        {
-            if(i!=idx)
-            {
-                top_picks.push_back(candidates->data[i]);
-            }
+    if (kcpp_params != nullptr) {
+        for (size_t i = 0; (i < candidates->size && i < kcpp_params->sparams.n_probs); ++i) {
+            top_picks.push_back(candidates->data[i]);
         }
     }
 
@@ -1549,6 +1544,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
     kcpp_params->dynatemp_exponent = inputs.dynatemp_exponent;
     kcpp_params->n_ctx = inputs.max_context_length;
     kcpp_params->smoothing_factor = inputs.smoothing_factor;
+    kcpp_params->sparams.n_probs = inputs.n_probs;
 
     bool stream_sse = inputs.stream_sse;
 
@@ -1556,6 +1552,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
 
     generation_finished = false; // Set current generation status
     generated_tokens.clear(); // New Generation, new tokens
+    generated_tokens_probs.clear();
 
     std::string grammarstr = inputs.grammar;
     bool grammar_retain_state = inputs.grammar_retain_state;
@@ -1996,6 +1993,16 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
                 if(stream_sse)
                 {
                     generated_tokens.push_back(tokenizedstr);
+
+                    token_probs_outputs token_probs_out;
+                    token_probs_out.count = std::min(top_picks.size(), n_probs_max);
+                    for (int i = 0; i < token_probs_out.count; ++i)
+                    {
+                        std::string tokenizedpick = FileFormatTokenizeID(top_picks[i].id, file_format);
+                        snprintf(token_probs_out.candidates[i].token, sizeof(token_probs_out.candidates[i].token), "%s", tokenizedpick.c_str());
+                        token_probs_out.candidates[i].prob = top_picks[i].p;
+                    }
+                    generated_tokens_probs.push_back(token_probs_out);
                 }
                 concat_output_mtx.lock();
                 concat_output += tokenizedstr;
